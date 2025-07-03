@@ -15,10 +15,14 @@ function App() {
     const success = urlParams.get('success');
     const userData = urlParams.get('user');
     
+    console.log('🔍 App: Checking URL params:', { error, success, userData: !!userData });
+    
     if (error) {
-      console.error('Auth error:', error);
+      console.error('❌ Auth error:', error);
       // Clear the error from URL and redirect to login
       window.history.replaceState({}, document.title, '/login');
+      setLoading(false);
+      return;
     }
     
     if (success === 'true' && userData) {
@@ -28,13 +32,18 @@ function App() {
         setUser(user);
         // Clear the success params from URL and redirect to chat
         window.history.replaceState({}, document.title, '/chat');
+        setLoading(false);
+        return;
       } catch (e) {
-        console.error('Failed to parse user data from URL:', e);
+        console.error('❌ Failed to parse user data from URL:', e);
         // If parsing fails, redirect to login
         window.history.replaceState({}, document.title, '/login');
+        setLoading(false);
+        return;
       }
     }
     
+    // If no URL params, just set loading to false
     setLoading(false);
   }, [setLoading, setUser]);
 

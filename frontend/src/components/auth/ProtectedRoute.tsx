@@ -44,14 +44,9 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
       }
     };
 
-    // Only check auth if we don't have a user or if we're not sure about auth status
-    if (!user || !isAuthenticated) {
-      checkAuth();
-    } else {
-      setIsChecking(false);
-      setLoading(false);
-    }
-  }, [setUser, setLoading, user, isAuthenticated]);
+    // Always check auth status when entering a protected route
+    checkAuth();
+  }, [setUser, setLoading, location.pathname]);
 
   // Show loading spinner while checking authentication
   if (isChecking) {
