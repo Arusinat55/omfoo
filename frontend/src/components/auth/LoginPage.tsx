@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Mail, Lock, Github } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
@@ -11,9 +11,27 @@ export const LoginPage: React.FC = () => {
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [searchParams] = useSearchParams();
   
   const navigate = useNavigate();
-  const { setUser } = useAuthStore();
+  const { setUser, isAuthenticated } = useAuthStore();
+
+  // Check for error in URL params
+  useEffect(() => {
+    const urlError = searchParams.get('error');
+    if (urlError) {
+      setError(`Authentication failed: ${urlError}`);
+      console.error('❌ Auth error from URL:', urlError);
+    }
+  }, [searchParams]);
+
+  // Redirect if already authenticated
+  useEffect(() => {
+    if (isAuthenticated) {
+      console.log('✅ User already authenticated, redirecting to chat');
+      navigate('/chat', { replace: true });
+    }
+  }, [isAuthenticated, navigate]);
 
   const handleEmailLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -21,16 +39,17 @@ export const LoginPage: React.FC = () => {
     setError('');
     
     try {
-      // Replace this with your actual email/password login API call
+      console.log('🔐 Attempting email/password login...');
       const response = await authAPI.login({ email, password });
       
       if (response.data.user) {
+        console.log('✅ Email login successful');
         setUser(response.data.user);
-        navigate('/chat'); // Navigate to chat after successful login
+        navigate('/chat', { replace: true });
       }
     } catch (error: any) {
-      console.error('Login failed:', error);
-      setError(error.message || 'Login failed. Please try again.');
+      console.error('❌ Email login failed:', error);
+      setError(error.response?.data?.error || error.message || 'Login failed. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -41,10 +60,18 @@ export const LoginPage: React.FC = () => {
       setIsLoading(true);
       setError('');
       
+      console.log('🔐 Initiating Google OAuth...');
+      
+      // Get the API URL from environment
+      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+      const googleAuthUrl = `${apiUrl}/auth/google`;
+      
+      console.log('🔗 Redirecting to:', googleAuthUrl);
+      
       // Redirect to Google OAuth - this will handle the full OAuth flow
-      window.location.href = `${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/auth/google`;
+      window.location.href = googleAuthUrl;
     } catch (error: any) {
-      console.error('Google login failed:', error);
+      console.error('❌ Google login failed:', error);
       setError('Google login failed. Please try again.');
       setIsLoading(false);
     }
@@ -126,6 +153,7 @@ export const LoginPage: React.FC = () => {
               className="w-full"
               loading={isLoading}
               size="lg"
+              disabled={isLoading}
             >
               Sign in
             </Button>
@@ -148,6 +176,7 @@ export const LoginPage: React.FC = () => {
                 className="w-full"
                 size="lg"
                 loading={isLoading}
+                disabled={isLoading}
               >
                 <svg className="w-5 h-5 mr-2" viewBox="0 0 24 24">
                   <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
@@ -163,7 +192,7 @@ export const LoginPage: React.FC = () => {
                 className="w-full"
                 size="lg"
                 icon={Github}
-                disabled={isLoading}
+                disabled={true}
               >
                 GitHub
               </Button>

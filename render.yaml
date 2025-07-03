@@ -25,7 +25,7 @@ services:
       - key: SESSION_SECRET
         sync: false
       - key: FRONTEND_URL
-        sync: false
+        value: https://ai-chatbot-frontend-9dq0.onrender.com
       - key: PYTHON_PATH
         value: /opt/render/project/src/.venv/bin/python
 
