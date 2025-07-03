@@ -7,7 +7,7 @@ console.log('🔗 Environment:', import.meta.env.MODE);
 
 const api = axios.create({
   baseURL: API_BASE_URL,
-  withCredentials: true,
+  withCredentials: true, // CRITICAL: This ensures cookies are sent with requests
   headers: {
     'Content-Type': 'application/json',
   },
@@ -20,6 +20,7 @@ api.interceptors.request.use(
     console.log(`🚀 API Request: ${config.method?.toUpperCase()} ${config.url}`);
     console.log('🍪 Request cookies:', document.cookie ? 'present' : 'missing');
     console.log('🔗 Full URL:', `${config.baseURL}${config.url}`);
+    console.log('🔧 With credentials:', config.withCredentials);
     return config;
   },
   (error) => {

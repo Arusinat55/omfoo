@@ -2,15 +2,14 @@ const express = require('express');
 const session = require('express-session');
 const cors = require('cors');
 const { OAuth2Client } = require('google-auth-library');
-const { OpenAI } = require('openai');
+const OpenAI = require('openai');
 const multer = require('multer');
-const { spawn } = require('child_process');
-const fs = require('fs').promises;
 const path = require('path');
+const fs = require('fs').promises;
+const { spawn } = require('child_process');
 require('dotenv').config();
 
-
-const upload = require('./middleware/upload');
+// Import models and services
 const User = require('./models/User');
 const Chat = require('./models/Chat');
 const Message = require('./models/Message');
@@ -18,1756 +17,725 @@ const Attachment = require('./models/Attachment');
 const AuthToken = require('./models/AuthToken');
 const FileUploadService = require('./services/fileUpload');
 const FileParser = require('./services/fileParser');
-
+const upload = require('./middleware/upload');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/google/callback';
 
-const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
-
-// CORS configuration - CRITICAL FIX
-const corsOptions = {
-    origin: function (origin, callback) {
-        const allowedOrigins = [
-            process.env.FRONTEND_URL,
-            'http://localhost:5173',
-            'http://localhost:3000',
-            'https://ai-chatbot-frontend-9dq0.onrender.com'
-        ].filter(Boolean);
-        
-        console.log('🔍 CORS Check - Origin:', origin, 'Allowed:', allowedOrigins);
-        
-        // Allow requests with no origin (mobile apps, etc.)
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            console.log('❌ CORS blocked origin:', origin);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    optionsSuccessStatus: 200 // For legacy browser support
-};
-
-// Middleware
-app.use(cors(corsOptions));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Session configuration - CRITICAL FIX
-app.use(session({
-    secret: process.env.SESSION_SECRET || 'your-secret-key-here',
-    resave: false,
-    saveUninitialized: false,
-    name: 'sessionId', // Custom session name
-    cookie: {
-        secure: process.env.NODE_ENV === 'production', // HTTPS only in production
-        httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // CRITICAL for cross-origin
-        domain: process.env.NODE_ENV === 'production' ? '.onrender.com' : undefined // Allow subdomain sharing
-    }
-}));
-
-// Add session debugging middleware
-app.use((req, res, next) => {
-    console.log('🍪 Session Debug:', {
-        sessionID: req.sessionID,
-        hasUser: !!req.session.user,
-        userEmail: req.session.user?.email,
-        cookies: req.headers.cookie ? 'present' : 'missing'
-    });
-    next();
-});
-
-// OpenAI client
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-});
-
-// MCP Server connection
-let mcpProcess = null;
-let mcpReady = false;
-let requestId = 1;
-let availableTools = [];
-let pendingResponses = new Map();
-let currentUserId = null;
-
-// Complete list of ALL MCP tools (30+ tools)
-const getAllMCPTools = () => [
-    // Google Drive Tools (10 tools)
-    {
-        type: "function",
-        function: {
-            name: "drive_search",
-            description: "Search for files in Google Drive by name, content, or metadata",
-            parameters: {
-                type: "object",
-                properties: {
-                    query: { type: "string", description: "Search query for files" },
-                    file_type: { type: "string", description: "Filter by file type (optional)" },
-                    folder_id: { type: "string", description: "Search within specific folder (optional)" }
-                },
-                required: ["query"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_list_files",
-            description: "List files in Google Drive with optional filtering",
-            parameters: {
-                type: "object",
-                properties: {
-                    folder_id: { type: "string", description: "Folder ID to list files from (optional)" },
-                    max_results: { type: "number", description: "Maximum number of files to return" }
-                },
-                required: []
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_read_file",
-            description: "Read the content of a file from Google Drive",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_id: { type: "string", description: "Google Drive file ID" }
-                },
-                required: ["file_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            // FIX: Renamed to match the Python tool name
-            name: "drive_create",
-            description: "Create a new file in Google Drive. Handles Google Docs, PDFs, and plain text.",
-            parameters: {
-                type: "object",
-                properties: {
-                    name: { type: "string", description: "Name of the file (e.g., 'My Document')" },
-                    // FIX: Changed mime_type to mimeType to match the Python tool's argument
-                    mimeType: { type: "string", description: "MIME type (e.g., 'application/vnd.google-apps.document', 'text/plain', 'application/pdf')" },
-                    content: { type: "string", description: "The text content for the file." },
-                    folder_id: { type: "string", description: "Optional parent folder ID to create the file in." }
-                },
-                // FIX: Added mimeType to the required parameters
-                required: ["name", "mimeType", "content"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_update_file",
-            description: "Update an existing file in Google Drive",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_id: { type: "string", description: "Google Drive file ID" },
-                    content: { type: "string", description: "New content for the file" },
-                    name: { type: "string", description: "New name for the file (optional)" }
-                },
-                required: ["file_id", "content"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_delete_file",
-            description: "Delete a file from Google Drive",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_id: { type: "string", description: "Google Drive file ID to delete" }
-                },
-                required: ["file_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_share_file",
-            description: "Share a Google Drive file with specific users or make it public",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_id: { type: "string", description: "Google Drive file ID" },
-                    email: { type: "string", description: "Email address to share with" },
-                    role: { type: "string", description: "Permission role (reader, writer, owner)" },
-                    type: { type: "string", description: "Permission type (user, anyone)" }
-                },
-                required: ["file_id", "email", "role"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_upload_file",
-            description: "Upload a local file to Google Drive",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Local path to the file to upload" },
-                    name: { type: "string", description: "Name for the file in Drive (optional)" },
-                    folder_id: { type: "string", description: "Parent folder ID (optional)" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "drive_create_folder",
-            description: "Create a new folder in Google Drive",
-            parameters: {
-                type: "object",
-                properties: {
-                    name: { type: "string", description: "Name of the folder to create" },
-                    parent_folder_id: { type: "string", description: "Parent folder ID (optional)" }
-                },
-                required: ["name"]
-            }
-        }
-    },
-
-
-    // Gmail Tools (8 tools)
-    {
-        type: "function",
-        function: {
-            name: "gmail_send_message",
-            description: "Send an email message via Gmail",
-            parameters: {
-                type: "object",
-                properties: {
-                    to: { type: "string", description: "Recipient email address" },
-                    subject: { type: "string", description: "Email subject" },
-                    body: { type: "string", description: "Email body content" },
-                    cc: { type: "string", description: "CC email addresses (optional)" },
-                    bcc: { type: "string", description: "BCC email addresses (optional)" }
-                },
-                required: ["to", "subject", "body"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_search_messages",
-            description: "Search for email messages in Gmail",
-            parameters: {
-                type: "object",
-                properties: {
-                    query: { type: "string", description: "Gmail search query" },
-                    max_results: { type: "number", description: "Maximum number of results" }
-                },
-                required: ["query"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_read_message",
-            description: "Read the content of a specific Gmail message",
-            parameters: {
-                type: "object",
-                properties: {
-                    message_id: { type: "string", description: "Gmail message ID" }
-                },
-                required: ["message_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_list_messages",
-            description: "List recent Gmail messages",
-            parameters: {
-                type: "object",
-                properties: {
-                    max_results: { type: "number", description: "Maximum number of messages to return" },
-                    label_ids: { type: "array", items: { type: "string" }, description: "Filter by label IDs" }
-                },
-                required: []
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_send_file_attachment",
-            description: "Send an email with file attachments",
-            parameters: {
-                type: "object",
-                properties: {
-                    to: { type: "string", description: "Recipient email address" },
-                    subject: { type: "string", description: "Email subject" },
-                    body: { type: "string", description: "Email body content" },
-                    file_path: { type: "string", description: "Path to file to attach" }
-                },
-                required: ["to", "subject", "body", "file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_list_labels",
-            description: "List all Gmail labels",
-            parameters: {
-                type: "object",
-                properties: {},
-                required: []
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_mark_as_read",
-            description: "Mark Gmail messages as read",
-            parameters: {
-                type: "object",
-                properties: {
-                    message_ids: { type: "array", items: { type: "string" }, description: "List of message IDs" }
-                },
-                required: ["message_ids"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "gmail_add_label",
-            description: "Add labels to Gmail messages",
-            parameters: {
-                type: "object",
-                properties: {
-                    message_ids: { type: "array", items: { type: "string" }, description: "List of message IDs" },
-                    label_ids: { type: "array", items: { type: "string" }, description: "List of label IDs to add" }
-                },
-                required: ["message_ids", "label_ids"]
-            }
-        }
-    },
-
-    // Google Calendar Tools (6 tools)
-    {
-        type: "function",
-        function: {
-            name: "calendar_create_event",
-            description: "Create a new event in Google Calendar",
-            parameters: {
-                type: "object",
-                properties: {
-                    summary: { type: "string", description: "Event title/summary" },
-                    start_time: { type: "string", description: "Event start time (ISO format)" },
-                    end_time: { type: "string", description: "Event end time (ISO format)" },
-                    description: { type: "string", description: "Event description (optional)" },
-                    attendees: { type: "array", items: { type: "string" }, description: "List of attendee emails" },
-                    location: { type: "string", description: "Event location (optional)" }
-                },
-                required: ["summary", "start_time", "end_time"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "calendar_list_events",
-            description: "List upcoming events from Google Calendar",
-            parameters: {
-                type: "object",
-                properties: {
-                    max_results: { type: "number", description: "Maximum number of events to return" },
-                    time_min: { type: "string", description: "Start time filter (ISO format)" },
-                    time_max: { type: "string", description: "End time filter (ISO format)" }
-                },
-                required: []
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "calendar_update_event",
-            description: "Update an existing calendar event",
-            parameters: {
-                type: "object",
-                properties: {
-                    event_id: { type: "string", description: "Calendar event ID" },
-                    summary: { type: "string", description: "New event title (optional)" },
-                    start_time: { type: "string", description: "New start time (optional)" },
-                    end_time: { type: "string", description: "New end time (optional)" },
-                    description: { type: "string", description: "New description (optional)" }
-                },
-                required: ["event_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "calendar_delete_event",
-            description: "Delete a calendar event",
-            parameters: {
-                type: "object",
-                properties: {
-                    event_id: { type: "string", description: "Calendar event ID to delete" }
-                },
-                required: ["event_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "calendar_get_free_busy",
-            description: "Check free/busy status for calendar users",
-            parameters: {
-                type: "object",
-                properties: {
-                    emails: { type: "array", items: { type: "string" }, description: "List of email addresses to check" },
-                    time_min: { type: "string", description: "Start time for check (ISO format)" },
-                    time_max: { type: "string", description: "End time for check (ISO format)" }
-                },
-                required: ["emails", "time_min", "time_max"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "calendar_find_meeting_time",
-            description: "Find available meeting times for multiple attendees",
-            parameters: {
-                type: "object",
-                properties: {
-                    attendees: { type: "array", items: { type: "string" }, description: "List of attendee emails" },
-                    duration_minutes: { type: "number", description: "Meeting duration in minutes" },
-                    preferred_times: { type: "array", items: { type: "string" }, description: "Preferred time slots" }
-                },
-                required: ["attendees", "duration_minutes"]
-            }
-        }
-    },
-
-    // Google Docs Tools (4 tools)
-    {
-        type: "function",
-        function: {
-            name: "docs_create_document",
-            description: "Create a new Google Docs document",
-            parameters: {
-                type: "object",
-                properties: {
-                    title: { type: "string", description: "Document title" },
-                    content: { type: "string", description: "Initial document content" }
-                },
-                required: ["title"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "docs_read_document",
-            description: "Read content from a Google Docs document",
-            parameters: {
-                type: "object",
-                properties: {
-                    document_id: { type: "string", description: "Google Docs document ID" }
-                },
-                required: ["document_id"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "docs_update_document",
-            description: "Update content in a Google Docs document",
-            parameters: {
-                type: "object",
-                properties: {
-                    document_id: { type: "string", description: "Google Docs document ID" },
-                    content: { type: "string", description: "New content to insert" },
-                    insert_index: { type: "number", description: "Position to insert content" }
-                },
-                required: ["document_id", "content"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "docs_export_document",
-            description: "Export Google Docs document to different formats",
-            parameters: {
-                type: "object",
-                properties: {
-                    document_id: { type: "string", description: "Google Docs document ID" },
-                    format: { type: "string", description: "Export format (pdf, docx, txt, html)" }
-                },
-                required: ["document_id", "format"]
-            }
-        }
-    },
-
-    // Google Sheets Tools (4 tools)
-    {
-        type: "function",
-        function: {
-            name: "sheets_create_spreadsheet",
-            description: "Create a new Google Sheets spreadsheet",
-            parameters: {
-                type: "object",
-                properties: {
-                    title: { type: "string", description: "Spreadsheet title" },
-                    sheet_names: { type: "array", items: { type: "string" }, description: "Names of sheets to create" }
-                },
-                required: ["title"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "sheets_read_range",
-            description: "Read data from a specific range in Google Sheets",
-            parameters: {
-                type: "object",
-                properties: {
-                    spreadsheet_id: { type: "string", description: "Google Sheets spreadsheet ID" },
-                    range: { type: "string", description: "Range to read (e.g., 'Sheet1!A1:C10')" }
-                },
-                required: ["spreadsheet_id", "range"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "sheets_write_range",
-            description: "Write data to a specific range in Google Sheets",
-            parameters: {
-                type: "object",
-                properties: {
-                    spreadsheet_id: { type: "string", description: "Google Sheets spreadsheet ID" },
-                    range: { type: "string", description: "Range to write to (e.g., 'Sheet1!A1:C10')" },
-                    values: { type: "array", description: "2D array of values to write" }
-                },
-                required: ["spreadsheet_id", "range", "values"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "sheets_append_data",
-            description: "Append data to the end of a Google Sheets spreadsheet",
-            parameters: {
-                type: "object",
-                properties: {
-                    spreadsheet_id: { type: "string", description: "Google Sheets spreadsheet ID" },
-                    range: { type: "string", description: "Range to append to" },
-                    values: { type: "array", description: "2D array of values to append" }
-                },
-                required: ["spreadsheet_id", "range", "values"]
-            }
-        }
-    },
-
-    // File Analysis Tools (6 tools)
-    {
-        type: "function",
-        function: {
-            name: "analyze_file",
-            description: "Analyze and extract information from uploaded files",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Path to the file to analyze" },
-                    analysis_type: { type: "string", description: "Type of analysis (content, metadata, structure)" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "extract_text_from_pdf",
-            description: "Extract text content from PDF files",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Path to the PDF file" },
-                    page_range: { type: "string", description: "Page range to extract (e.g., '1-5')" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "extract_text_from_docx",
-            description: "Extract text content from Word documents",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Path to the DOCX file" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "analyze_image",
-            description: "Analyze image files and extract information",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Path to the image file" },
-                    analysis_type: { type: "string", description: "Type of analysis (metadata, content, ocr)" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "extract_data_from_csv",
-            description: "Extract and analyze data from CSV files",
-            parameters: {
-                type: "object",
-                properties: {
-                    file_path: { type: "string", description: "Path to the CSV file" },
-                    delimiter: { type: "string", description: "CSV delimiter (default: comma)" },
-                    has_header: { type: "boolean", description: "Whether CSV has header row" }
-                },
-                required: ["file_path"]
-            }
-        }
-    },
-    {
-        type: "function",
-        function: {
-            name: "convert_file_format",
-            description: "Convert files between different formats",
-            parameters: {
-                type: "object",
-                properties: {
-                    input_file_path: { type: "string", description: "Path to input file" },
-                    output_format: { type: "string", description: "Target format (pdf, docx, txt, etc.)" },
-                    output_path: { type: "string", description: "Output file path (optional)" }
-                },
-                required: ["input_file_path", "output_format"]
-            }
-        }
-    }
+// Environment validation
+const requiredEnvVars = [
+  'OPENAI_API_KEY',
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'GOOGLE_REDIRECT_URI',
+  'SESSION_SECRET',
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY'
 ];
 
-// Initialize MCP Server
-async function initializeMCP(userId) {
-    if (!userId) {
-        console.error('❌ Cannot start MCP without userId');
-        return;
-    }
-    currentUserId = userId;
-
-    const mcpPath = path.join(__dirname, 'mcp_toolkit.py');
-
-    let tokenData;
-    try {
-        tokenData = await AuthToken.findByUserId(userId);
-        if (!tokenData) throw new Error('No auth token found for user');
-    } catch (err) {
-        console.error('❌ Failed to load token from Supabase:', err.message);
-        return;
-    }
-
-    const mcpEnv = {
-        ...process.env,
-        PYTHONUNBUFFERED: '1',
-        GOOGLE_ACCESS_TOKEN: tokenData.access_token,
-        GOOGLE_REFRESH_TOKEN: tokenData.refresh_token,
-        GOOGLE_TOKEN_EXPIRES_AT: new Date(tokenData.expires_at).getTime().toString(),
-        SESSION_USER_ID: userId
-    };
-    console.log('🔐 Starting MCP with tokens:', {
-        access: tokenData.access_token?.substring(0, 5) + '...',
-        refresh: tokenData.refresh_token?.substring(0, 5) + '...',
-        expires: tokenData.expires_at
-    });
-    mcpProcess = spawn('python', [mcpPath], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: mcpEnv
-    });
-    let outputBuffer = '';
-
-    mcpProcess.stdout.on('data', (data) => {
-        outputBuffer += data.toString();
-        const lines = outputBuffer.split('\n');
-        outputBuffer = lines.pop() || '';
-
-        for (let line of lines) {
-            if (line.trim()) {
-                console.log('MCP Raw Output:', line);
-
-                if (line.includes('Server ready') || line.includes('Google Drive service initialized')) {
-                    mcpReady = true;
-                    console.log('✅ MCP Server is ready');
-                }
-
-                try {
-                    const response = JSON.parse(line);
-                    console.log('📥 MCP JSON Response:', response);
-
-                    if (response.id && pendingResponses.has(response.id)) {
-                        const { resolve, reject } = pendingResponses.get(response.id);
-                        pendingResponses.delete(response.id);
-
-                        if (response.error) {
-                            reject(new Error(response.error.message || JSON.stringify(response.error)));
-                        } else {
-                            resolve(response.result);
-                        }
-                    }
-                } catch (e) {
-                    if (!line.includes('WARNING') && !line.includes('oauth2client')) {
-                        console.log('📄 MCP Status:', line);
-                    }
-                }
-            }
-        }
-    });
-     mcpProcess.stderr.on('data', (data) => {
-        // This will print any and all messages from Python's stderr stream
-        console.error(`[PYTHON STDERR]: ${data.toString()}`);
-    });
-    // --- END OF ADDED BLOCK ---
-
-    // It's also good practice to know if the process closes unexpectedly
-    mcpProcess.on('close', (code) => {
-        console.log(`MCP process exited with code ${code}`);
-        mcpProcess = null; // Clear the process variable
-        mcpReady = false;
-    });
-
-    setTimeout(() => {
-        initializeMCPHandshake();
-    }, 2000);
-}
-async function initializeMCPHandshake() {
-    try {
-        console.log('🤝 Starting MCP handshake...');
-
-        const initResponse = await sendMCPRequest('initialize', {
-            protocolVersion: '2024-11-05',
-            capabilities: {
-                roots: {
-                    listChanged: true
-                },
-                sampling: {}
-            },
-            clientInfo: {
-                name: 'google-workspace-client',
-                version: '1.0.0'
-            }
-        });
-
-        console.log('✅ MCP Initialize response:', initResponse);
-        await sendMCPNotification('notifications/initialized');
-        console.log('✅ MCP Handshake completed');
-        await getAvailableTools();
-
-    } catch (error) {
-        console.error('❌ MCP Handshake failed:', error);
-        setTimeout(() => {
-            initializeMCPHandshake();
-        }, 5000);
-    }
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars);
+  process.exit(1);
 }
 
-async function getAvailableTools() {
-    try {
-        console.log('🔍 Getting available tools...');
-        const toolsResponse = await sendMCPRequest('tools/list');
+console.log('✅ Environment variables validated');
+console.log('🔗 Frontend URL:', process.env.FRONTEND_URL);
+console.log('🔗 Google Redirect URI:', process.env.GOOGLE_REDIRECT_URI);
+console.log('🔗 Environment:', process.env.NODE_ENV);
 
-        if (toolsResponse && toolsResponse.tools) {
-            availableTools = toolsResponse.tools.map(tool => ({
-                type: "function",
-                function: {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.inputSchema || {
-                        type: "object",
-                        properties: {},
-                        required: []
-                    }
-                }
-            }));
+// Initialize services
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
 
-            console.log('✅ Available tools loaded dynamically:', availableTools.map(t => t.function.name));
-        } else {
-            throw new Error('No tools received from MCP');
-        }
-    } catch (error) {
-        console.error('❌ Error getting tools dynamically, using fallback:', error);
-        // Use complete fallback tools
-        availableTools = getAllMCPTools();
-        console.log(`✅ Loaded ${availableTools.length} fallback tools:`, availableTools.map(t => t.function.name));
-    }
-}
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-function sendMCPRequest(method, params = {}) {
-    return new Promise((resolve, reject) => {
-        if (!mcpProcess || !mcpProcess.stdin) {
-            reject(new Error('MCP process not available'));
-            return;
-        }
-
-        const currentRequestId = requestId++;
-        const request = {
-            jsonrpc: '2.0',
-            id: currentRequestId,
-            method: method,
-            params: params
-        };
-
-        console.log('📤 Sending MCP request:', JSON.stringify(request));
-
-        pendingResponses.set(currentRequestId, { resolve, reject });
-
-        setTimeout(() => {
-            if (pendingResponses.has(currentRequestId)) {
-                pendingResponses.delete(currentRequestId);
-                reject(new Error(`MCP request timeout for method: ${method}`));
-            }
-        }, 30000);
-
-        try {
-            mcpProcess.stdin.write(JSON.stringify(request) + '\n');
-        } catch (error) {
-            pendingResponses.delete(currentRequestId);
-            reject(error);
-        }
-    });
-}
-
-function sendMCPNotification(method, params = {}) {
-    return new Promise((resolve, reject) => {
-        if (!mcpProcess || !mcpProcess.stdin) {
-            reject(new Error('MCP process not available'));
-            return;
-        }
-
-        const notification = {
-            jsonrpc: '2.0',
-            method: method,
-            params: params
-        };
-
-        console.log('📤 Sending MCP notification:', JSON.stringify(notification));
-
-        try {
-            mcpProcess.stdin.write(JSON.stringify(notification) + '\n');
-            resolve(true);
-        } catch (error) {
-            reject(error);
-        }
-    });
-}
-
-async function callMCPTool(toolName, params) {
-    try {
-        console.log(`🔧 Calling MCP tool: ${toolName}`, params);
-
-        const result = await sendMCPRequest('tools/call', {
-            name: toolName,
-            arguments: params
-        });
-
-        console.log(`✅ Tool ${toolName} result:`, result);
-
-        if (result && result.content) {
-            if (Array.isArray(result.content)) {
-                return result.content.map(item => item.text || item).join('\n');
-            } else if (typeof result.content === 'object' && result.content.text) {
-                return result.content.text;
-            } else {
-                return result.content.toString();
-            }
-        } else if (typeof result === 'string') {
-            return result;
-        } else {
-            return JSON.stringify(result);
-        }
-    } catch (error) {
-        console.error(`❌ Error calling tool ${toolName}:`, error);
-
-        return `Error: The tool '${toolName}' failed to execute. Reason: ${error.message}`;
-    }
-}
-
-function getDemoToolResponse(toolName, params) {
-    const demoResponses = {
-        // Google Drive
-        'drive_search': `Demo: Found 3 files matching "${params.query}": Document1.docx, Spreadsheet1.xlsx, Presentation1.pptx`,
-        'drive_list_files': 'Demo: Listed 10 files from Google Drive: file1.pdf, file2.docx, file3.xlsx...',
-        'drive_read_file': `Demo: Reading file content for ${params.file_id}. Content: "This is sample file content..."`,
-        'drive_create': `Demo: Created file "${params.name}" successfully. File ID: demo_file_123`,
-        'drive_update_file': `Demo: Updated file ${params.file_id} with new content`,
-        'drive_delete': `Demo: Deleted file ${params.file_id} successfully`,
-        'drive_share_file': `Demo: Shared file ${params.file_id} with ${params.email} as ${params.role}`,
-        'drive_upload_file': `Demo: Uploaded file from ${params.file_path} to Google Drive`,
-        'drive_create_folder': `Demo: Created folder "${params.name}" successfully`,
-        'drive_get_file_metadata': `Demo: File metadata for ${params.file_id}: Name: Sample.pdf, Size: 1.2MB, Modified: Today`,
-
-        // Gmail
-        'gmail_send_message': `Demo: Email sent to ${params.to} with subject "${params.subject}"`,
-        'gmail_search_messages': `Demo: Found 5 messages matching "${params.query}"`,
-        'gmail_read_message': `Demo: Message content: "This is a sample email message..."`,
-        'gmail_list_messages': 'Demo: Listed 10 recent messages from Gmail inbox',
-        'gmail_send_file_attachment': `Demo: Email with attachment sent to ${params.to}`,
-        'gmail_list_labels': 'Demo: Labels: Inbox, Sent, Drafts, Important, Work, Personal',
-        'gmail_mark_as_read': `Demo: Marked ${params.message_ids.length} messages as read`,
-        'gmail_add_label': `Demo: Added labels to ${params.message_ids.length} messages`,
-
-        // Calendar
-        'calendar_create_event': `Demo: Created event "${params.summary}" for ${params.start_time}`,
-        'calendar_list_events': 'Demo: Upcoming events: Meeting at 2PM, Call at 4PM, Dinner at 7PM',
-        'calendar_update_event': `Demo: Updated event ${params.event_id}`,
-        'calendar_delete_event': `Demo: Deleted event ${params.event_id}`,
-        'calendar_get_free_busy': `Demo: Free/busy status for ${params.emails.join(', ')}: Available 9-11AM, Busy 2-4PM`,
-        'calendar_find_meeting_time': `Demo: Available meeting slots: 10AM-11AM, 3PM-4PM tomorrow`,
-
-        // Google Docs
-        'docs_create_document': `Demo: Created document "${params.title}" successfully`,
-        'docs_read_document': `Demo: Document content: "This is sample document content..."`,
-        'docs_update_document': `Demo: Updated document ${params.document_id} with new content`,
-        'docs_export_document': `Demo: Exported document ${params.document_id} as ${params.format}`,
-
-        // Google Sheets
-        'sheets_create_spreadsheet': `Demo: Created spreadsheet "${params.title}" successfully`,
-        'sheets_read_range': `Demo: Data from ${params.range}: [["Name", "Age"], ["John", "25"], ["Jane", "30"]]`,
-        'sheets_write_range': `Demo: Wrote data to ${params.range} successfully`,
-        'sheets_append_data': `Demo: Appended ${params.values.length} rows to spreadsheet`,
-
-        // File Analysis
-        'analyze_file': `Demo: Analyzed file ${params.file_path}. Type: ${params.analysis_type || 'content'}. Results: File contains text, images, and metadata.`,
-        'extract_text_from_pdf': `Demo: Extracted text from PDF: "This is sample PDF content extracted from ${params.file_path}..."`,
-        'extract_text_from_docx': `Demo: Extracted text from Word document: "Sample document content..."`,
-        'analyze_image': `Demo: Image analysis of ${params.file_path}: Resolution: 1920x1080, Format: PNG, Contains: text, objects`,
-        'extract_data_from_csv': `Demo: CSV data extracted: 100 rows, 5 columns (Name, Age, City, Email, Phone)`,
-        'convert_file_format': `Demo: Converted ${params.input_file_path} to ${params.output_format} format`
-    };
-
-    return demoResponses[toolName] || `Demo: Executed ${toolName} with parameters: ${JSON.stringify(params)}`;
-}
-
-// Authentication middleware
-const requireAuth = (req, res, next) => {
-    console.log('🔐 Auth Check:', {
-        hasSession: !!req.session,
-        hasUser: !!req.session.user,
-        userEmail: req.session.user?.email,
-        sessionID: req.sessionID
-    });
+// CORS configuration - CRITICAL for cross-origin cookie handling
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
     
-    if (!req.session.user) {
-        console.log('❌ Authentication failed - no user in session');
-        return res.status(401).json({ error: 'Authentication required' });
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'https://ai-chatbot-frontend-9dq0.onrender.com',
+      process.env.FRONTEND_URL
+    ].filter(Boolean);
+    
+    console.log('🔍 CORS Check - Origin:', origin);
+    
+    if (allowedOrigins.includes(origin)) {
+      console.log('✅ CORS: Origin allowed');
+      callback(null, true);
+    } else {
+      console.log('❌ CORS: Origin not allowed');
+      callback(new Error('Not allowed by CORS'));
     }
-    next();
+  },
+  credentials: true, // CRITICAL: This must be true for cookies to work
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 200 // For legacy browser support
 };
 
-// Google OAuth routes
-app.get('/auth/google', (req, res) => {
-    console.log('🔍 Starting Google OAuth flow...');
-    const authUrl = googleClient.generateAuthUrl({
-        access_type: 'offline',
-        scope: [
-            'https://www.googleapis.com/auth/userinfo.profile',
-            'https://www.googleapis.com/auth/userinfo.email',
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/gmail.send',
-            'https://www.googleapis.com/auth/gmail.labels',
-            'https://www.googleapis.com/auth/gmail.modify',
-            'https://www.googleapis.com/auth/calendar.events',
-            'https://www.googleapis.com/auth/calendar.readonly',
-            'https://www.googleapis.com/auth/documents',
-            'https://www.googleapis.com/auth/spreadsheets'
-        ],
-        prompt: 'consent'
+app.use(cors(corsOptions));
+
+// Trust proxy for production (Render uses proxies)
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
+// Enhanced session configuration for cross-origin persistence
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+    httpOnly: true, // Prevent XSS attacks
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days (longer for better UX)
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // CRITICAL for cross-origin
+    domain: process.env.NODE_ENV === 'production' ? '.onrender.com' : undefined // Share across subdomains
+  },
+  name: 'ai_chatbot_session', // Custom session name
+  rolling: true // Reset expiry on each request
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Enhanced request logging middleware
+app.use((req, res, next) => {
+  console.log(`📝 ${req.method} ${req.path}`);
+  console.log(`🔍 Origin: ${req.get('Origin') || 'none'}`);
+  console.log(`🍪 Cookies: ${req.headers.cookie ? 'present' : 'missing'}`);
+  console.log(`👤 Session: ${req.session?.user?.email || 'none'}`);
+  console.log(`🆔 Session ID: ${req.sessionID || 'none'}`);
+  next();
+});
+
+// Root route for health checks
+app.get('/', (req, res) => {
+  res.json({
+    status: 'healthy',
+    service: 'ai-chatbot-backend',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    session: req.session?.user ? 'authenticated' : 'anonymous'
+  });
+});
+
+// MCP Server Management
+let mcpProcess = null;
+let mcpReady = false;
+
+async function startMCPServer(userId = null) {
+  try {
+    console.log('🚀 Starting MCP server...');
+    
+    if (mcpProcess) {
+      console.log('🔄 Stopping existing MCP server...');
+      mcpProcess.kill();
+      mcpProcess = null;
+      mcpReady = false;
+    }
+
+    const pythonPath = process.env.PYTHON_PATH || 'python3';
+    const scriptPath = path.join(__dirname, 'mcp_toolkit.py');
+    
+    // Set up environment for MCP server
+    const mcpEnv = { ...process.env };
+    
+    if (userId) {
+      try {
+        const tokenData = await AuthToken.findByUserId(userId);
+        if (tokenData) {
+          mcpEnv.GOOGLE_ACCESS_TOKEN = tokenData.access_token;
+          mcpEnv.GOOGLE_REFRESH_TOKEN = tokenData.refresh_token;
+          mcpEnv.GOOGLE_ID_TOKEN = tokenData.id_token;
+          mcpEnv.GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+          mcpEnv.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+          mcpEnv.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+          console.log('✅ MCP: Complete token data loaded for user');
+        }
+      } catch (error) {
+        console.error('❌ MCP: Failed to load token data:', error);
+      }
+    }
+
+    mcpProcess = spawn(pythonPath, [scriptPath], {
+      env: mcpEnv,
+      stdio: ['pipe', 'pipe', 'pipe']
     });
-    console.log('🔗 Redirecting to Google OAuth URL');
-    res.redirect(authUrl);
+
+    mcpProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log('📡 MCP stdout:', output.trim());
+      if (output.includes('MCP server ready')) {
+        mcpReady = true;
+        console.log('✅ MCP server is ready');
+      }
+    });
+
+    mcpProcess.stderr.on('data', (data) => {
+      console.error('📡 MCP stderr:', data.toString().trim());
+    });
+
+    mcpProcess.on('close', (code) => {
+      console.log(`📡 MCP process exited with code ${code}`);
+      mcpReady = false;
+    });
+
+    mcpProcess.on('error', (error) => {
+      console.error('📡 MCP process error:', error);
+      mcpReady = false;
+    });
+
+    // Wait a bit for the server to start
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to start MCP server:', error);
+    return false;
+  }
+}
+
+// Start MCP server on startup
+startMCPServer();
+
+// Authentication Routes
+app.get('/auth/google', (req, res) => {
+  console.log('🔐 Google OAuth initiated');
+  console.log('🔍 Request origin:', req.get('Origin'));
+  console.log('🔍 Request referer:', req.get('Referer'));
+  
+  const authUrl = googleClient.generateAuthUrl({
+    access_type: 'offline',
+    scope: [
+      'openid',
+      'profile',
+      'email',
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/gmail.modify',
+      'https://www.googleapis.com/auth/calendar'
+    ],
+    prompt: 'consent',
+    state: req.get('Origin') || process.env.FRONTEND_URL // Pass origin for redirect
+  });
+  
+  console.log('🔗 Redirecting to Google OAuth URL');
+  res.redirect(authUrl);
 });
 
 app.get('/auth/google/callback', async (req, res) => {
-    try {
-        const { code, error } = req.query;
-
-        if (error) {
-            console.error('❌ OAuth error:', error);
-            return res.redirect(`${process.env.FRONTEND_URL}/login?error=${encodeURIComponent(error)}`);
-        }
-
-        if (!code) {
-            console.error('❌ No authorization code received');
-            return res.redirect(`${process.env.FRONTEND_URL}/login?error=no_code`);
-        }
-
-        console.log('🔐 Processing Google OAuth callback...');
-
-        const { tokens } = await googleClient.getToken(code);
-        console.log('✅ Received OAuth tokens');
-
-        // Get user info
-        googleClient.setCredentials(tokens);
-        const ticket = await googleClient.verifyIdToken({
-            idToken: tokens.id_token,
-            audience: GOOGLE_CLIENT_ID
-        });
-
-        const payload = ticket.getPayload();
-        const googleId = payload.sub;
-
-        console.log('👤 User info retrieved:', { email: payload.email, name: payload.name });
-
-        // Find or create user in database
-        let user = await User.findByGoogleId(googleId);
-
-        if (!user) {
-            console.log('🆕 Creating new user...');
-            user = await User.create({
-                googleId: googleId,
-                email: payload.email,
-                name: payload.name,
-                picture: payload.picture
-            });
-        } else {
-            console.log('👋 Existing user found, updating info...');
-            user = await User.update(user.id, {
-                email: payload.email,
-                name: payload.name,
-                picture: payload.picture
-            });
-        }
-
-        // Store or update auth tokens
-        const expiresAt = new Date(Date.now() + (tokens.expiry_date || 3600000));
-
-        const existingToken = await AuthToken.findByUserId(user.id);
-        if (existingToken) {
-            await AuthToken.update(user.id, {
-                access_token: tokens.access_token,
-                refresh_token: tokens.refresh_token,
-                id_token: tokens.id_token,
-                expires_at: expiresAt
-            });
-        } else {
-            await AuthToken.create({
-                userId: user.id,
-                accessToken: tokens.access_token,
-                refreshToken: tokens.refresh_token,
-                idToken: tokens.id_token,
-                expiresAt: expiresAt
-            });
-        }
-
-        // CRITICAL: Store user session BEFORE redirect
-        req.session.user = {
-            id: user.id,
-            email: user.email,
-            name: user.name,
-            picture: user.picture
-        };
-
-        // Store tokens in session for immediate use
-        req.session.tokens = tokens;
-
-        console.log('💾 User session created successfully:', {
-            userId: user.id,
-            email: user.email,
-            sessionID: req.sessionID
-        });
-
-        // Save session explicitly before redirect
-        req.session.save((err) => {
-            if (err) {
-                console.error('❌ Session save error:', err);
-                return res.redirect(`${process.env.FRONTEND_URL}/login?error=session_error`);
-            }
-
-            console.log('✅ Session saved successfully');
-
-            // Initialize MCP after session is saved
-            try {
-                initializeMCP(user.id);
-                console.log("✅ MCP initialization started");
-            } catch (error) {
-                console.error("❌ MCP initialization error:", error);
-            }
-
-            console.log('🔄 Redirecting to chat interface...');
-            res.redirect(`${process.env.FRONTEND_URL}/chat`);
-        });
-
-    } catch (error) {
-        console.error('❌ Google OAuth callback error:', error);
-        res.redirect(`${process.env.FRONTEND_URL}/login?error=auth_failed`);
+  try {
+    console.log('🔐 Google OAuth callback received');
+    console.log('🔍 Query params:', req.query);
+    
+    const { code, error, state } = req.query;
+    
+    if (error) {
+      console.error('❌ OAuth error:', error);
+      const frontendUrl = state || process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(error)}`);
     }
-});
-
-app.get('/auth/user', async (req, res) => {
-    try {
-        console.log('🔍 Auth check request:', {
-            hasSession: !!req.session,
-            hasUser: !!req.session.user,
-            userEmail: req.session.user?.email,
-            sessionID: req.sessionID,
-            cookies: req.headers.cookie ? 'present' : 'missing'
-        });
-
-        if (req.session.user) {
-            // Get user preferences
-            const preferences = await User.getPreferences(req.session.user.id);
-
-            console.log('✅ User authenticated:', req.session.user.email);
-
-            res.json({
-                authenticated: true,
-                user: {
-                    ...req.session.user,
-                    preferences: preferences || {
-                        preferred_model: 'gpt-4',
-                        enabled_tools: [],
-                        settings: {}
-                    }
-                }
-            });
-        } else {
-            console.log('❌ User not authenticated - no session user');
-            res.json({
-                authenticated: false,
-                user: null
-            });
-        }
-    } catch (error) {
-        console.error('❌ Error checking auth:', error);
-        res.json({
-            authenticated: false,
-            user: null
-        });
+    
+    if (!code) {
+      console.error('❌ No authorization code received');
+      const frontendUrl = state || process.env.FRONTEND_URL || 'http://localhost:5173';
+      return res.redirect(`${frontendUrl}/login?error=no_code`);
     }
-});
-
-app.post('/auth/logout', async (req, res) => {
-    try {
-        console.log('👋 User logging out:', req.session.user?.email);
-        
-        if (req.session.user) {
-            // Optionally clean up tokens from database
-            await AuthToken.delete(req.session.user.id);
-        }
-
-        req.session.destroy((err) => {
-            if (err) {
-                console.error('❌ Session destruction error:', err);
-                return res.status(500).json({ error: 'Failed to logout' });
-            }
-            
-            res.clearCookie('sessionId');
-            console.log('✅ User logged out successfully');
-            res.json({ success: true });
-        });
-    } catch (error) {
-        console.error('❌ Logout error:', error);
-        res.status(500).json({ error: 'Failed to logout' });
-    }
-});
-
-// Chat endpoint with database integration
-app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
-    try {
-        const { message, chatId, model = 'gpt-4', enabledTools = '[]' } = req.body;
-        const userId = req.session.user.id;
-        const files = req.files || [];
-
-        console.log(`📝 Chat request received:`, {
-            userId,
-            message: message ? `${message.substring(0, 100)}...` : 'No message',
-            model,
-            filesCount: files.length,
-            chatId: chatId || 'new'
-        });
-
-        if (!message && files.length === 0) {
-            return res.status(400).json({ error: 'Message or attachments required' });
-        }
-
-        // Initialize tools if not already done
-        if (availableTools.length === 0) {
-            console.log('🔧 Initializing tools...');
-            availableTools = getAllMCPTools();
-            console.log(`✅ Initialized ${availableTools.length} tools`);
-        }
-
-        let currentChatId = chatId;
-        let chat;
-
-        // Create or get chat
-        if (!currentChatId || currentChatId === 'new') {
-            const title = message ? message.substring(0, 50) + '...' : `File Upload: ${files.map(f => f.originalname).join(', ')}`;
-            console.log(`📁 Creating new chat: ${title}`);
-            chat = await Chat.create(userId, title);
-            currentChatId = chat.id;
-        } else {
-            console.log(`📁 Using existing chat: ${currentChatId}`);
-            chat = await Chat.findById(currentChatId);
-            if (!chat) {
-                return res.status(404).json({ error: 'Chat not found' });
-            }
-        }
-
-        // Handle file uploads
-        let fileContents = [];
-        for (const file of files) {
-            try {
-                console.log(`📎 File uploaded: ${file.originalname}`);
-
-                // Upload file to Supabase Storage
-                const uploadResult = await FileUploadService.uploadFile(file, userId);
-                console.log(`☁️ File uploaded to storage: ${uploadResult.storagePath}`);
-
-                // Parse file content
-                const parsedContent = await FileParser.parseFile(
-                    uploadResult.storagePath,
-                    uploadResult.mimeType,
-                    uploadResult.originalName
-                );
-
-                fileContents.push({
-                    filename: uploadResult.originalName,
-                    content: parsedContent,
-                    mimeType: uploadResult.mimeType
-                });
-
-                // Save attachment to database
-                await Attachment.create({
-                    messageId: null, // Will be updated after message creation
-                    userId: userId,
-                    filename: uploadResult.filename, // This should never be null now
-                    originalName: uploadResult.originalName,
-                    mimeType: uploadResult.mimeType,
-                    fileSize: uploadResult.fileSize,
-                    storagePath: uploadResult.storagePath
-                });
-
-            } catch (fileError) {
-                console.error(`❌ Error processing file ${file.originalname}:`, fileError);
-                fileContents.push({
-                    filename: file.originalname,
-                    content: `Error processing file: ${fileError.message}`,
-                    mimeType: file.mimetype
-                });
-            }
-        }
-
-        // Build user message content
-        let userMessageContent = message || '';
-        if (fileContents.length > 0) {
-            const fileDescriptions = fileContents.map(file =>
-                `File: "${file.filename}" (${file.mimeType})\nContent: ${file.content}`
-            ).join('\n\n');
-            userMessageContent = message ? `${message}\n\nUploaded Files:\n${fileDescriptions}` : `Uploaded Files:\n${fileDescriptions}`;
-        }
-
-
-        // Get chat history for context
-        const chatHistory = await Message.findByChatId(currentChatId);
-
-        // Build conversation for OpenAI
-        const messages = [
-            {
-                role: "system",
-                content: `You are a helpful AI assistant with access to Google Workspace services through specialized tools. You can:
-
-🔍 **Google Drive**: Search files, read documents, create documents, move files, share files
-📧 **Gmail**: List emails, read messages, send emails, send with Drive attachments
-📅 **Google Calendar**: List events, create events, check availability, update events
-
-**Important Guidelines:**
-- You CAN and SHOULD call multiple tools in sequence to complete complex tasks
-- When users ask you to "create a document and send it to someone", do BOTH actions
-- Break down complex requests into multiple tool calls
-- Always explain what you're doing step by step
-- If a tool call fails, try an alternative approach
-
-**Multi-step Example Workflows:**
-- Create document → Share with user → Send email with link
-- Search for file → Read content → Create summary document → Send to recipient
-- Create calendar event → Send email invitation
-
-**Available Tools:**
-${availableTools.map(tool => `- ${tool.function.name}: ${tool.function.description}`).join('\n')}
-
-Always think step-by-step and use multiple tools when needed to fully complete the user's request.`
-            }
-        ];
-
-        // Add chat history (excluding current message)
-        chatHistory.slice(0, -1).forEach(msg => {
-            messages.push({
-                role: msg.role,
-                content: msg.content
-            });
-        });
-        // Save user message
-        const userMessage = await Message.create({
-            chatId: currentChatId,
-            userId: userId,
-            role: 'user',
-            content: userMessageContent,
-            model: model,
-            toolsUsed: [],
-            attachments: files.map(file => ({
-                filename: file.originalname,
-                original_name: file.originalname,
-                mime_type: file.mimetype,
-                file_size: file.size
-            }))
-        });
-
-        messages.push(userMessage);
-        console.log(`💬 Processing chat for user ${userId}, chat ${currentChatId}`);
-        console.log(`🛠️  Available tools: ${availableTools.length}`);
-
-
-        // Parse enabled tools
-        let parsedEnabledTools = [];
-        try {
-            const enabledToolsString = req.body.enabledTools || '[]';
-            parsedEnabledTools = JSON.parse(enabledToolsString);
-        } catch (e) {
-            console.warn('Failed to parse enabled tools:', e);
-            parsedEnabledTools = [];
-        }
-        const allPossibleTools = availableTools;
-        let filteredTools;
-        if (parsedEnabledTools.length > 0) {
-            // If the user has specific tools enabled, filter the master list
-            const enabledToolNames = new Set(parsedEnabledTools);
-            filteredTools = allPossibleTools.filter(tool => enabledToolNames.has(tool.function.name));
-        } else {
-            // If no preferences are set, use ALL tools defined in the master list
-            filteredTools = allPossibleTools;
-        }
-
-
-        console.log(`🛠️ Using ${filteredTools.length} tools for model ${model}:`, filteredTools.map(t => t.function.name));
-
-        // Initialize token tracking
-        let totalInputTokens = 0;
-        let totalOutputTokens = 0;
-        let totalCost = 0;
-
-        // Call OpenAI
-        const completion = await openai.chat.completions.create({
-            model: model,
-            messages: messages,
-            tools: filteredTools,
-            tool_choice: "auto",
-            temperature: 0.7,
-            max_tokens: 3000
-        });
-
-        // Track tokens from initial completion
-        if (completion.usage) {
-            totalInputTokens += completion.usage.prompt_tokens || 0;
-            totalOutputTokens += completion.usage.completion_tokens || 0;
-
-            console.log(`📊 Initial API Call - Input tokens: ${completion.usage.prompt_tokens}, Output tokens: ${completion.usage.completion_tokens}`);
-        }
-
-        let response = completion.choices[0].message;
-        let finalResponse = response.content;
-        let toolsUsed = [];
-
-        // Handle function calls
-        if (response.tool_calls && response.tool_calls.length > 0) {
-            console.log(`🔧 Processing ${response.tool_calls.length} tool calls`);
-
-            messages.push(response);
-
-            for (const toolCall of response.tool_calls) {
-                try {
-                    const toolName = toolCall.function.name;
-                    const toolArgs = JSON.parse(toolCall.function.arguments);
-
-                    console.log(`🔧 Executing tool: ${toolName}`, toolArgs);
-
-                    const result = await callMCPTool(toolName, toolArgs);
-                    toolsUsed.push(toolName);
-
-                    messages.push({
-                        role: "tool",
-                        tool_call_id: toolCall.id,
-                        name: toolName,
-                        content: result
-                    });
-
-                    console.log(`✅ Tool ${toolName} completed successfully`);
-                } catch (error) {
-                    console.error(`❌ Tool ${toolCall.function.name} failed:`, error);
-                    messages.push({
-                        role: "tool",
-                        tool_call_id: toolCall.id,
-                        name: toolCall.function.name,
-                        content: `Error executing ${toolCall.function.name}: ${error.message}`
-                    });
-                }
-            }
-
-            // Get final response
-            const finalCompletion = await openai.chat.completions.create({
-                model: model,
-                messages: messages,
-                tools: filteredTools,
-                tool_choice: "auto",
-                temperature: 0.7,
-                max_tokens: 3000
-            });
-            let currentResponse = finalCompletion.choices[0].message;
-            let maxIterations = 5; // Prevent infinite loops
-            let iterations = 0;
-            while (currentResponse.tool_calls && currentResponse.tool_calls.length > 0 && iterations < maxIterations) {
-                iterations++;
-                console.log(`🔧 Processing additional tool calls (iteration ${iterations})`);
-
-                messages.push(currentResponse);
-
-                for (const toolCall of currentResponse.tool_calls) {
-                    try {
-                        const toolName = toolCall.function.name;
-                        const toolArgs = JSON.parse(toolCall.function.arguments);
-
-                        const result = await callMCPTool(toolName, toolArgs);
-
-                        messages.push({
-                            role: "tool",
-                            tool_call_id: toolCall.id,
-                            name: toolName,
-                            content: result
-                        });
-                    } catch (error) {
-                        messages.push({
-                            role: "tool",
-                            tool_call_id: toolCall.id,
-                            name: toolCall.function.name,
-                            content: `Error: ${error.message}`
-                        });
-                    }
-                }
-
-                const nextCompletion = await openai.chat.completions.create({
-                    model: model,
-                    messages: messages,
-                    tools: filteredTools,
-                    tool_choice: "auto",
-                    temperature: 0.7,
-                    max_tokens: 3000
-                });
-
-                currentResponse = nextCompletion.choices[0].message;
-            }
-            if (finalCompletion.usage) {
-                totalInputTokens += finalCompletion.usage.prompt_tokens || 0;
-                totalOutputTokens += finalCompletion.usage.completion_tokens || 0;
-
-                console.log(`📊 Final API Call - Input tokens: ${finalCompletion.usage.prompt_tokens}, Output tokens: ${finalCompletion.usage.completion_tokens}`);
-            }
-            finalResponse = currentResponse.content;
-        }
-
-        // Calculate estimated cost
-        const modelPricing = {
-            'gpt-4': { input: 0.03 / 1000, output: 0.06 / 1000 },
-            'gpt-4-turbo': { input: 0.01 / 1000, output: 0.03 / 1000 },
-            'gpt-3.5-turbo': { input: 0.001 / 1000, output: 0.002 / 1000 }
-        };
-
-        if (modelPricing[model]) {
-            const pricing = modelPricing[model];
-            totalCost = (totalInputTokens * pricing.input) + (totalOutputTokens * pricing.output);
-        }
-
-        // Print comprehensive token usage
-        console.log(`📊 ===== TOKEN USAGE SUMMARY =====`);
-        console.log(`🔤 Model: ${model}`);
-        console.log(`📥 Total Input Tokens: ${totalInputTokens}`);
-        console.log(`📤 Total Output Tokens: ${totalOutputTokens}`);
-        console.log(`🔢 Total Tokens: ${totalInputTokens + totalOutputTokens}`);
-        if (totalCost > 0) {
-            console.log(`💰 Estimated Cost: $${totalCost.toFixed(6)}`);
-        }
-        console.log(`🛠️ Tools Used: ${toolsUsed.join(', ') || 'None'}`);
-        console.log(`⏰ Timestamp: ${new Date().toISOString()}`);
-        console.log(`================================`);
-
-        // Save assistant message
-        await Message.create({
-            chatId: currentChatId,
-            userId: userId,
-            role: 'assistant',
-            content: finalResponse,
-            model: model,
-            toolsUsed: toolsUsed
-        });
-
-        // Update chat timestamp
-        await Chat.update(currentChatId, {});
-
-        console.log('✅ Chat response generated successfully');
-
-        res.json({
-            response: finalResponse,
-            chatId: currentChatId,
-            model: model,
-            timestamp: new Date().toISOString(),
-            toolsUsed: toolsUsed,
-            mcpReady: mcpReady,
-            tokenUsage: {
-                inputTokens: totalInputTokens,
-                outputTokens: totalOutputTokens,
-                totalTokens: totalInputTokens + totalOutputTokens,
-                estimatedCost: totalCost > 0 ? totalCost : null
-            }
-        });
-
-    } catch (error) {
-        console.error('❌ Chat error:', error);
-        res.status(500).json({
-            error: 'Failed to process chat message',
-            details: error.message,
-            mcpReady: mcpReady
-        });
-    }
-});
-
-// Get chat history
-app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
-    try {
-        const { chatId } = req.params;
-        const userId = req.session.user.id;
-
-        const chat = await Chat.getWithMessages(chatId, userId);
-
-        if (!chat) {
-            return res.status(404).json({ error: 'Chat not found' });
-        }
-
-        res.json(chat);
-    } catch (error) {
-        console.error('Error loading chat:', error);
-        res.status(500).json({ error: 'Failed to load chat' });
-    }
-});
-
-// Get user chats
-app.get('/api/chats/:userId', requireAuth, async (req, res) => {
-    try {
-        const { userId } = req.params;
-
-        if (userId !== req.session.user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        const chats = await Chat.findByUserId(userId);
-        res.json({ chats });
-    } catch (error) {
-        console.error('Error getting chats:', error);
-        res.status(500).json({ error: 'Failed to get chats' });
-    }
-});
-
-// Delete chat
-app.delete('/api/chat/:chatId', requireAuth, async (req, res) => {
-    try {
-        const { chatId } = req.params;
-        const userId = req.session.user.id;
-
-        // Verify chat belongs to user
-        const chat = await Chat.findById(chatId);
-        if (!chat || chat.user_id !== userId) {
-            return res.status(404).json({ error: 'Chat not found' });
-        }
-
-        await Chat.delete(chatId);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error deleting chat:', error);
-        res.status(500).json({ error: 'Failed to delete chat' });
-    }
-});
-
-// Tools API
-app.get('/api/tools', (req, res) => {
-    // Ensure tools are initialized
-    if (availableTools.length === 0) {
-        availableTools = getAllMCPTools();
-    }
-
-    res.json({
-        tools: availableTools,
-        mcpReady: mcpReady,
-        totalTools: availableTools.length
+    
+    console.log('🔐 Exchanging code for tokens...');
+    const { tokens } = await googleClient.getTokens(code);
+    
+    console.log('🔐 Getting user info...');
+    googleClient.setCredentials(tokens);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
-});
-
-// MCP Status and Control
-app.get('/api/mcp/status', (req, res) => {
-    res.json({
-        mcpReady: mcpReady,
-        processRunning: mcpProcess !== null,
-        availableTools: availableTools.length,
-        tools: availableTools.map(t => t.function.name),
-        timestamp: new Date().toISOString()
+    
+    const payload = ticket.getPayload();
+    console.log('✅ User authenticated:', payload.email);
+    
+    // Find or create user
+    let user = await User.findByGoogleId(payload.sub);
+    if (!user) {
+      console.log('👤 Creating new user...');
+      user = await User.create({
+        googleId: payload.sub,
+        email: payload.email,
+        name: payload.name,
+        picture: payload.picture
+      });
+    } else {
+      console.log('👤 Updating existing user...');
+      user = await User.update(user.id, {
+        name: payload.name,
+        picture: payload.picture
+      });
+    }
+    
+    // Store tokens with all required fields
+    const expiresAt = new Date(Date.now() + (tokens.expires_in * 1000));
+    
+    try {
+      // Delete existing tokens first
+      await AuthToken.delete(user.id);
+    } catch (e) {
+      // Ignore if no existing tokens
+    }
+    
+    await AuthToken.create({
+      userId: user.id,
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token || null,
+      idToken: tokens.id_token,
+      expiresAt: expiresAt.toISOString()
     });
+    
+    console.log('✅ Tokens stored successfully');
+    
+    // CRITICAL: Set session BEFORE redirect
+    req.session.user = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      picture: user.picture
+    };
+    
+    // Force session save before redirect
+    req.session.save((err) => {
+      if (err) {
+        console.error('❌ Session save error:', err);
+      } else {
+        console.log('✅ Session saved successfully for user:', user.email);
+        console.log('🆔 Session ID:', req.sessionID);
+      }
+      
+      // Restart MCP server with new credentials
+      startMCPServer(user.id);
+      
+      // Redirect to frontend
+      const frontendUrl = state || process.env.FRONTEND_URL || 'http://localhost:5173';
+      console.log('🔄 Redirecting to frontend:', frontendUrl);
+      
+      // Use a simple redirect to /chat - the frontend will handle auth state
+      res.redirect(`${frontendUrl}/chat`);
+    });
+    
+  } catch (error) {
+    console.error('❌ OAuth callback error:', error);
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(error.message)}`);
+  }
 });
 
-app.post('/api/mcp/restart', requireAuth, (req, res) => {
-    console.log('🔄 Manual MCP restart requested');
-    restartMCP();
-    res.json({ success: true, message: 'MCP restart initiated' });
+app.get('/auth/user', (req, res) => {
+  console.log('🔍 Auth check requested');
+  console.log('🔍 Session user:', req.session?.user?.email || 'none');
+  console.log('🔍 Session ID:', req.sessionID);
+  console.log('🔍 Cookies present:', !!req.headers.cookie);
+  console.log('🔍 Session object:', JSON.stringify(req.session, null, 2));
+  
+  if (req.session?.user) {
+    console.log('✅ User authenticated via session');
+    res.json({
+      authenticated: true,
+      user: req.session.user
+    });
+  } else {
+    console.log('❌ User not authenticated');
+    res.status(401).json({
+      authenticated: false,
+      user: null,
+      debug: {
+        sessionExists: !!req.session,
+        sessionId: req.sessionID,
+        cookiesPresent: !!req.headers.cookie
+      }
+    });
+  }
 });
 
-// User preferences
-app.get('/api/user/preferences', requireAuth, async (req, res) => {
-    try {
-        const preferences = await User.getPreferences(req.session.user.id);
-        res.json(preferences || {
-            preferred_model: 'gpt-4',
-            enabled_tools: [],
-            settings: {}
-        });
-    } catch (error) {
-        console.error('Error getting preferences:', error);
-        res.status(500).json({ error: 'Failed to get preferences' });
+app.post('/auth/logout', (req, res) => {
+  console.log('👋 Logout requested for user:', req.session?.user?.email || 'unknown');
+  
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('❌ Session destruction error:', err);
+      return res.status(500).json({ error: 'Failed to logout' });
     }
+    
+    res.clearCookie('ai_chatbot_session');
+    console.log('✅ User logged out successfully');
+    res.json({ success: true });
+  });
 });
 
-app.put('/api/user/preferences', requireAuth, async (req, res) => {
-    try {
-        const preferences = await User.updatePreferences(req.session.user.id, req.body);
-        res.json(preferences);
-    } catch (error) {
-        console.error('Error updating preferences:', error);
-        res.status(500).json({ error: 'Failed to update preferences' });
-    }
-});
+// Authentication middleware
+const requireAuth = (req, res, next) => {
+  console.log('🔒 Auth middleware check');
+  console.log('🔍 Session user:', req.session?.user?.email || 'none');
+  
+  if (!req.session?.user) {
+    console.log('❌ Authentication required - no session');
+    return res.status(401).json({ 
+      error: 'Authentication required',
+      debug: {
+        sessionExists: !!req.session,
+        sessionId: req.sessionID,
+        cookiesPresent: !!req.headers.cookie
+      }
+    });
+  }
+  next();
+};
 
-// Health check
+// Health check endpoint
 app.get('/api/health', (req, res) => {
-    // Ensure tools are initialized
-    if (availableTools.length === 0) {
-        availableTools = getAllMCPTools();
-    }
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    mcpReady,
+    environment: process.env.NODE_ENV || 'development',
+    service: 'ai-chatbot-backend',
+    session: req.session?.user ? 'authenticated' : 'anonymous'
+  });
+});
 
-    res.json({
-        status: 'ok',
-        mcpReady: mcpReady,
-        availableTools: availableTools.length,
-        tools: availableTools.map(t => t.function.name),
-        timestamp: new Date().toISOString(),
-        toolCategories: {
-            'Google Drive': availableTools.filter(t => t.function.name.startsWith('drive_')).length,
-            'Gmail': availableTools.filter(t => t.function.name.startsWith('gmail_')).length,
-            'Calendar': availableTools.filter(t => t.function.name.startsWith('calendar_')).length,
-            'Google Docs': availableTools.filter(t => t.function.name.startsWith('docs_')).length,
-            'Google Sheets': availableTools.filter(t => t.function.name.startsWith('sheets_')).length,
-            'File Analysis': availableTools.filter(t => ['analyze_file', 'extract_text_from_pdf', 'extract_text_from_docx', 'analyze_image', 'extract_data_from_csv', 'convert_file_format'].includes(t.function.name)).length
-        }
+// MCP status endpoint
+app.get('/api/mcp/status', (req, res) => {
+  res.json({
+    ready: mcpReady,
+    processRunning: mcpProcess !== null,
+    pid: mcpProcess?.pid || null
+  });
+});
+
+// Restart MCP server endpoint
+app.post('/api/mcp/restart', requireAuth, async (req, res) => {
+  try {
+    console.log('🔄 MCP restart requested by:', req.session.user.email);
+    await startMCPServer(req.session.user.id);
+    res.json({ success: true, ready: mcpReady });
+  } catch (error) {
+    console.error('❌ MCP restart failed:', error);
+    res.status(500).json({ error: 'Failed to restart MCP server' });
+  }
+});
+
+// Chat endpoints
+app.post('/api/chat', requireAuth, upload.array('attachments', 5), async (req, res) => {
+  try {
+    const { message, chatId, model = 'gpt-4', enabledTools = [] } = req.body;
+    const userId = req.session.user.id;
+    const files = req.files || [];
+    
+    console.log('💬 Chat request:', {
+      userId: req.session.user.email,
+      message: message?.substring(0, 100) + '...',
+      chatId,
+      model,
+      filesCount: files.length,
+      enabledTools: JSON.parse(enabledTools || '[]')
     });
+    
+    if (!message && files.length === 0) {
+      return res.status(400).json({ error: 'Message or files required' });
+    }
+    
+    let currentChatId = chatId;
+    let chat;
+    
+    // Create or get chat
+    if (!currentChatId || currentChatId === 'new') {
+      const title = message ? message.substring(0, 50) + '...' : 'File Upload';
+      chat = await Chat.create(userId, title);
+      currentChatId = chat.id;
+      console.log('📝 Created new chat:', currentChatId);
+    } else {
+      chat = await Chat.findById(currentChatId);
+      if (!chat || chat.user_id !== userId) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+    }
+    
+    // Handle file uploads
+    let attachmentData = [];
+    let fileContents = [];
+    
+    if (files.length > 0) {
+      console.log('📎 Processing file uploads...');
+      
+      for (const file of files) {
+        try {
+          // Upload file to Supabase Storage
+          const uploadResult = await FileUploadService.uploadFile(file, userId);
+          
+          // Create attachment record
+          const attachment = await Attachment.create({
+            messageId: null, // Will be updated after message creation
+            userId,
+            filename: uploadResult.filename,
+            originalName: uploadResult.originalName,
+            mimeType: uploadResult.mimeType,
+            fileSize: uploadResult.fileSize,
+            storagePath: uploadResult.storagePath
+          });
+          
+          attachmentData.push(attachment);
+          
+          // Parse file content
+          const content = await FileParser.parseFile(
+            uploadResult.storagePath,
+            uploadResult.mimeType,
+            uploadResult.originalName
+          );
+          
+          fileContents.push({
+            filename: uploadResult.originalName,
+            content
+          });
+          
+          console.log('✅ File processed:', uploadResult.originalName);
+        } catch (error) {
+          console.error('❌ File processing error:', error);
+          fileContents.push({
+            filename: file.originalname,
+            content: `Error processing file: ${error.message}`
+          });
+        }
+      }
+    }
+    
+    // Prepare message content
+    let fullMessage = message || '';
+    if (fileContents.length > 0) {
+      const fileSection = fileContents.map(file => 
+        `\n\n--- File: ${file.filename} ---\n${file.content}`
+      ).join('');
+      fullMessage += fileSection;
+    }
+    
+    // Create user message
+    const userMessage = await Message.create({
+      chatId: currentChatId,
+      userId,
+      role: 'user',
+      content: message || 'File upload',
+      model,
+      attachments: attachmentData.map(att => ({
+        id: att.id,
+        filename: att.filename,
+        original_name: att.original_name,
+        mime_type: att.mime_type,
+        file_size: att.file_size,
+        storage_path: att.storage_path
+      }))
+    });
+    
+    // Update attachment records with message ID
+    for (const attachment of attachmentData) {
+      await Attachment.update(attachment.id, { message_id: userMessage.id });
+    }
+    
+    // Get AI response
+    console.log('🤖 Getting AI response...');
+    
+    const messages = [
+      {
+        role: 'system',
+        content: `You are a helpful AI assistant with access to Google Workspace tools. You can help with Google Drive, Gmail, Calendar, and file analysis. The user has uploaded ${files.length} file(s) if any.`
+      },
+      {
+        role: 'user',
+        content: fullMessage
+      }
+    ];
+    
+    const completion = await openai.chat.completions.create({
+      model,
+      messages,
+      temperature: 0.7,
+      max_tokens: 2000
+    });
+    
+    const aiResponse = completion.choices[0].message.content;
+    
+    // Create assistant message
+    await Message.create({
+      chatId: currentChatId,
+      userId,
+      role: 'assistant',
+      content: aiResponse,
+      model,
+      toolsUsed: []
+    });
+    
+    // Update chat timestamp
+    await Chat.update(currentChatId, { updated_at: new Date().toISOString() });
+    
+    console.log('✅ Chat response sent');
+    
+    res.json({
+      response: aiResponse,
+      chatId: currentChatId,
+      model,
+      toolsUsed: []
+    });
+    
+  } catch (error) {
+    console.error('❌ Chat error:', error);
+    res.status(500).json({ error: 'Failed to process chat message' });
+  }
+});
+
+app.get('/api/chat/:chatId', requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.session.user.id;
+    
+    const chatData = await Chat.getWithMessages(chatId, userId);
+    
+    if (!chatData) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    res.json(chatData);
+  } catch (error) {
+    console.error('❌ Get chat error:', error);
+    res.status(500).json({ error: 'Failed to get chat' });
+  }
+});
+
+app.get('/api/chats/:userId', requireAuth, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Ensure user can only access their own chats
+    if (userId !== req.session.user.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const chats = await Chat.findByUserId(userId);
+    res.json({ chats });
+  } catch (error) {
+    console.error('❌ Get chats error:', error);
+    res.status(500).json({ error: 'Failed to get chats' });
+  }
+});
+
+app.delete('/api/chat/:chatId', requireAuth, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.session.user.id;
+    
+    // Verify ownership
+    const chat = await Chat.findById(chatId);
+    if (!chat || chat.user_id !== userId) {
+      return res.status(404).json({ error: 'Chat not found' });
+    }
+    
+    await Chat.delete(chatId);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Delete chat error:', error);
+    res.status(500).json({ error: 'Failed to delete chat' });
+  }
+});
+
+// Tools endpoint
+app.get('/api/tools', requireAuth, (req, res) => {
+  // Return available tools (fallback list)
+  const tools = [
+    {
+      function: {
+        name: 'drive_search',
+        description: 'Search for files in Google Drive'
+      }
+    },
+    {
+      function: {
+        name: 'drive_read_file',
+        description: 'Read content from a Google Drive file'
+      }
+    },
+    {
+      function: {
+        name: 'gmail_send',
+        description: 'Send an email via Gmail'
+      }
+    },
+    {
+      function: {
+        name: 'calendar_create_event',
+        description: 'Create a new calendar event'
+      }
+    }
+  ];
+  
+  res.json({ tools });
 });
 
 // File download endpoint
 app.get('/api/attachments/:attachmentId/download', requireAuth, async (req, res) => {
-    try {
-        const { attachmentId } = req.params;
-        const attachment = await Attachment.findById(attachmentId);
-
-        if (!attachment) {
-            return res.status(404).json({ error: 'Attachment not found' });
-        }
-
-        // Check if user has access to this attachment
-        if (attachment.user_id !== req.session.user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        // Get signed URL from Supabase
-        const signedUrl = await Attachment.getSignedUrl(attachment.storage_path);
-        res.redirect(signedUrl);
-    } catch (error) {
-        console.error('Error downloading attachment:', error);
-        res.status(500).json({ error: 'Failed to download attachment' });
+  try {
+    const { attachmentId } = req.params;
+    const attachment = await Attachment.findById(attachmentId);
+    
+    if (!attachment) {
+      return res.status(404).json({ error: 'Attachment not found' });
     }
+    
+    const signedUrl = await Attachment.getSignedUrl(attachment.storage_path);
+    res.redirect(signedUrl);
+  } catch (error) {
+    console.error('❌ Download error:', error);
+    res.status(500).json({ error: 'Failed to download file' });
+  }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-    console.error('Server error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  console.error('❌ Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
-app.listen(PORT, async () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
-    console.log(`🔐 Google OAuth configured: ${!!GOOGLE_CLIENT_ID}`);
-
-    // Initialize tools immediately
-    availableTools = getAllMCPTools();
-    console.log(`✅ Initialized ${availableTools.length} MCP tools`);
-
-    // Initialize MCP server
-    console.log('🟡 Skipping MCP startup — will initialize after user login');
+// 404 handler
+app.use((req, res) => {
+  console.log('❌ 404 - Route not found:', req.method, req.path);
+  res.status(404).json({ error: 'Route not found' });
 });
 
 // Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, shutting down gracefully');
+  if (mcpProcess) {
+    mcpProcess.kill();
+  }
+  process.exit(0);
+});
+
 process.on('SIGINT', () => {
-    console.log('🛑 Shutting down server...');
-    if (mcpProcess) {
-        mcpProcess.kill();
-    }
-    process.exit(0);
+  console.log('🛑 SIGINT received, shutting down gracefully');
+  if (mcpProcess) {
+    mcpProcess.kill();
+  }
+  process.exit(0);
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🔗 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL}`);
 });
