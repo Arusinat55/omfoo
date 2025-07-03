@@ -79,7 +79,7 @@ PYTHON_PATH=/opt/render/project/src/.venv/bin/python
    Name: ai-chatbot-frontend
    Branch: main (or your default branch)
    Root Directory: (leave empty)
-   Build Command: cd frontend && npm install && npm run build
+   Build Command: cd frontend && npm install && npm run build && cp public/_redirects dist/_redirects
    Publish Directory: frontend/dist
    ```
 
@@ -89,7 +89,7 @@ Add these environment variables for the frontend:
 
 ```bash
 VITE_API_URL=https://your-backend-url.onrender.com
-VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_URL=https://your-project-id.supabase.co
 VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
 ```
 
@@ -152,7 +152,20 @@ VITE_API_URL=https://your-actual-backend-url.onrender.com
 
 ### Common Issues
 
-#### 1. Build Failures
+#### 1. "Not Found" Error on Mobile/Desktop
+
+**Cause**: Missing `_redirects` file in build output
+**Solution**: Ensure build command includes: `&& cp public/_redirects dist/_redirects`
+
+#### 2. Redirect Loop to Login Page
+
+**Cause**: Authentication not persisting or CORS issues
+**Solutions**:
+- Verify `FRONTEND_URL` is set correctly in backend
+- Check that cookies are being set with proper domain
+- Ensure `withCredentials: true` in frontend API calls
+
+#### 3. Build Failures
 
 **Backend build fails:**
 - Check that Python dependencies can be installed
@@ -164,7 +177,7 @@ VITE_API_URL=https://your-actual-backend-url.onrender.com
 - Check for TypeScript errors
 - Verify all dependencies are in package.json
 
-#### 2. Authentication Issues
+#### 4. Authentication Issues
 
 **Google OAuth not working:**
 - Verify redirect URIs match exactly (including https://)
@@ -175,14 +188,14 @@ VITE_API_URL=https://your-actual-backend-url.onrender.com
 - Verify SESSION_SECRET is set
 - Check that cookies are working (HTTPS required)
 
-#### 3. API Connection Issues
+#### 5. API Connection Issues
 
 **Frontend can't reach backend:**
 - Verify VITE_API_URL is correct
 - Check CORS settings in backend
 - Ensure backend is running and healthy
 
-#### 4. Database Issues
+#### 6. Database Issues
 
 **Supabase connection fails:**
 - Verify Supabase URL and keys are correct
@@ -264,3 +277,26 @@ If you encounter issues:
 1. **Check Render dashboard** for usage
 2. **Monitor bandwidth usage**
 3. **Consider upgrading** for better performance and reliability
+
+## Critical Fixes Applied
+
+### 1. Fixed `_redirects` File Copy
+- Updated build command to ensure `_redirects` file is copied to dist folder
+- This fixes the "Not Found" errors on mobile and direct URL access
+
+### 2. Improved Authentication Flow
+- Enhanced error handling in OAuth callback
+- Better redirect logic after successful authentication
+- Fixed authentication persistence issues
+
+### 3. Enhanced API Configuration
+- Improved error handling and logging
+- Better CORS configuration for production
+- Fixed session management issues
+
+### 4. Updated Deployment Configuration
+- Corrected build commands in `render.yaml`
+- Ensured proper environment variable handling
+- Fixed static site deployment configuration
+
+These fixes should resolve the login redirect loops and "Not Found" errors you were experiencing.

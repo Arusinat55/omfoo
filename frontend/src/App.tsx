@@ -17,8 +17,8 @@ function App() {
     
     if (error) {
       console.error('Auth error:', error);
-      // Clear the error from URL
-      window.history.replaceState({}, document.title, window.location.pathname);
+      // Clear the error from URL and redirect to login
+      window.history.replaceState({}, document.title, '/login');
     }
     
     if (success === 'true' && userData) {
@@ -30,6 +30,8 @@ function App() {
         window.history.replaceState({}, document.title, '/chat');
       } catch (e) {
         console.error('Failed to parse user data from URL:', e);
+        // If parsing fails, redirect to login
+        window.history.replaceState({}, document.title, '/login');
       }
     }
     
@@ -118,7 +120,7 @@ function App() {
           } 
         />
         
-        {/* Catch all route */}
+        {/* Catch all route - redirect to appropriate page */}
         <Route 
           path="*" 
           element={

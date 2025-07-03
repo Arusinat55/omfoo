@@ -42,7 +42,7 @@ api.interceptors.response.use(
 
     // Handle authentication errors
     if (error.response?.status === 401) {
-      console.log('🔄 Authentication error - redirecting to login');
+      console.log('🔄 Authentication error - user needs to login');
       // Don't redirect here, let the component handle it
     }
 
@@ -55,6 +55,10 @@ export const authAPI = {
   checkAuth: () => {
     console.log('🔍 Checking authentication status...');
     return api.get('/auth/user');
+  },
+  login: async (credentials: { email: string; password: string }) => {
+    console.log('🔐 Attempting email/password login...');
+    return api.post('/auth/login', credentials);
   },
   logout: () => {
     console.log('👋 Logging out...');
