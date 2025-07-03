@@ -6,46 +6,63 @@ import { ChatLayout } from './components/chat/ChatLayout';
 import { useAuthStore } from './store/authStore';
 
 function App() {
-  const { isAuthenticated, isLoading, setLoading, setUser } = useAuthStore();
+  const { isAuthenticated, isLoading, setLoading, setUser, logout } = useAuthStore();
 
   useEffect(() => {
-    // Check for auth success/error in URL params (from OAuth callback)
-    const urlParams = new URLSearchParams(window.location.search);
-    const error = urlParams.get('error');
-    const success = urlParams.get('success');
-    const userData = urlParams.get('user');
-    
-    console.log('🔍 App: Checking URL params:', { error, success, userData: !!userData });
-    
-    if (error) {
-      console.error('❌ Auth error:', error);
-      // Clear the error from URL and redirect to login
-      window.history.replaceState({}, document.title, '/login');
-      setLoading(false);
-      return;
-    }
-    
-    if (success === 'true' && userData) {
-      try {
-        const user = JSON.parse(decodeURIComponent(userData));
-        console.log('✅ OAuth success, setting user:', user);
-        setUser(user);
-        // Clear the success params from URL and redirect to chat
-        window.history.replaceState({}, document.title, '/chat');
-        setLoading(false);
-        return;
-      } catch (e) {
-        console.error('❌ Failed to parse user data from URL:', e);
-        // If parsing fails, redirect to login
+    const handleAuthCallback = () => {
+      // Check for auth success/error in URL params (from OAuth callback)
+      const urlParams = new URLSearchParams(window.location.search);
+      const error = urlParams.get('error');
+      const success = urlParams.get('success');
+      const userData = urlParams.get('user');
+      
+      console.log('🔍 App: Checking URL params:', { 
+        error, 
+        success, 
+        userData: !!userData,
+        currentPath: window.location.pathname,
+        fullUrl: window.location.href
+      });
+      
+      if (error) {
+        console.error('❌ Auth error:', error);
+        logout();
+        // Clear the error from URL and redirect to login
         window.history.replaceState({}, document.title, '/login');
         setLoading(false);
-        return;
+        return true;
       }
-    }
+      
+      if (success === 'true' && userData) {
+        try {
+          const user = JSON.parse(decodeURIComponent(userData));
+          console.log('✅ OAuth success, setting user:', user);
+          setUser(user);
+          // Clear the success params from URL and redirect to chat
+          window.history.replaceState({}, document.title, '/chat');
+          setLoading(false);
+          return true;
+        } catch (e) {
+          console.error('❌ Failed to parse user data from URL:', e);
+          logout();
+          // If parsing fails, redirect to login
+          window.history.replaceState({}, document.title, '/login');
+          setLoading(false);
+          return true;
+        }
+      }
+      
+      return false;
+    };
+
+    // Handle auth callback if present
+    const wasCallback = handleAuthCallback();
     
-    // If no URL params, just set loading to false
-    setLoading(false);
-  }, [setLoading, setUser]);
+    // If not a callback, just set loading to false
+    if (!wasCallback) {
+      setLoading(false);
+    }
+  }, [setLoading, setUser, logout]);
 
   if (isLoading) {
     return (

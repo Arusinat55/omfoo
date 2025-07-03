@@ -16,12 +16,20 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
     const checkAuth = async () => {
       try {
         console.log('🔍 ProtectedRoute: Checking authentication status...');
+        console.log('🔍 ProtectedRoute: Current auth state:', { isAuthenticated, userEmail: user?.email });
+        
         setIsChecking(true);
+        
+        // If we already have a user in store, try to verify it's still valid
+        if (user && isAuthenticated) {
+          console.log('🔍 ProtectedRoute: User exists in store, verifying with server...');
+        }
         
         const response = await authAPI.checkAuth();
         console.log('✅ ProtectedRoute: Auth check response:', {
           authenticated: response.data.authenticated,
-          userEmail: response.data.user?.email
+          userEmail: response.data.user?.email,
+          status: response.status
         });
         
         if (response.data.authenticated && response.data.user) {
@@ -35,9 +43,18 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
         console.error('❌ ProtectedRoute: Auth check failed:', {
           status: error.response?.status,
           message: error.message,
-          data: error.response?.data
+          data: error.response?.data,
+          url: error.config?.url
         });
-        setUser(null);
+        
+        // Only clear user if we get a definitive auth error
+        if (error.response?.status === 401) {
+          console.log('❌ ProtectedRoute: 401 Unauthorized - clearing user');
+          setUser(null);
+        } else {
+          console.log('❌ ProtectedRoute: Network/other error - keeping current auth state');
+          // Don't clear user on network errors, just proceed with current state
+        }
       } finally {
         setIsChecking(false);
         setLoading(false);
