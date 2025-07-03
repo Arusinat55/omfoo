@@ -76,15 +76,13 @@ class AuthToken {
       throw new Error('No authentication tokens found for user');
     }
     
-    // Return complete token data that can be used by mcp_toolkit.py
+    // Return token data that can be used by mcp_toolkit.py
+    // This will be passed as environment variables instead of a file
     return {
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
       id_token: tokenData.id_token,
-      expires_at: tokenData.expires_at,
-      token_uri: 'https://oauth2.googleapis.com/token',
-      client_id: process.env.GOOGLE_CLIENT_ID,
-      client_secret: process.env.GOOGLE_CLIENT_SECRET
+      expires_at: tokenData.expires_at
     };
   }
 }

@@ -42,7 +42,6 @@ if (missingEnvVars.length > 0) {
 console.log('✅ Environment variables validated');
 console.log('🔗 Frontend URL:', process.env.FRONTEND_URL);
 console.log('🔗 Google Redirect URI:', process.env.GOOGLE_REDIRECT_URI);
-console.log('🔗 Environment:', process.env.NODE_ENV);
 
 // Initialize services
 const googleClient = new OAuth2Client(
@@ -69,6 +68,7 @@ const corsOptions = {
     ].filter(Boolean);
     
     console.log('🔍 CORS Check - Origin:', origin);
+    console.log('🔍 CORS Check - Allowed origins:', allowedOrigins);
     
     if (allowedOrigins.includes(origin)) {
       console.log('✅ CORS: Origin allowed');
@@ -109,16 +109,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Root route for health checks
-app.get('/', (req, res) => {
-  res.json({
-    status: 'healthy',
-    service: 'ai-chatbot-backend',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  });
-});
-
 // MCP Server Management
 let mcpProcess = null;
 let mcpReady = false;
@@ -147,10 +137,7 @@ async function startMCPServer(userId = null) {
           mcpEnv.GOOGLE_ACCESS_TOKEN = tokenData.access_token;
           mcpEnv.GOOGLE_REFRESH_TOKEN = tokenData.refresh_token;
           mcpEnv.GOOGLE_ID_TOKEN = tokenData.id_token;
-          mcpEnv.GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token';
-          mcpEnv.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-          mcpEnv.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-          console.log('✅ MCP: Complete token data loaded for user');
+          console.log('✅ MCP: Token data loaded for user');
         }
       } catch (error) {
         console.error('❌ MCP: Failed to load token data:', error);
@@ -267,25 +254,15 @@ app.get('/auth/google/callback', async (req, res) => {
       });
     }
     
-    // Store tokens with all required fields
+    // Store tokens
     const expiresAt = new Date(Date.now() + (tokens.expires_in * 1000));
-    
-    try {
-      // Delete existing tokens first
-      await AuthToken.delete(user.id);
-    } catch (e) {
-      // Ignore if no existing tokens
-    }
-    
     await AuthToken.create({
       userId: user.id,
       accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token || null,
+      refreshToken: tokens.refresh_token,
       idToken: tokens.id_token,
       expiresAt: expiresAt.toISOString()
     });
-    
-    console.log('✅ Tokens stored successfully');
     
     // Set session
     req.session.user = {
@@ -362,8 +339,7 @@ app.get('/api/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     mcpReady,
-    environment: process.env.NODE_ENV || 'development',
-    service: 'ai-chatbot-backend'
+    environment: process.env.NODE_ENV || 'development'
   });
 });
 
